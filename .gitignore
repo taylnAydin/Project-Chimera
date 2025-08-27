@@ -1,0 +1,11 @@
+# Sanal ortam
+venv/
+__pycache__/
+*.pyc
+
+# IDE dosyaları
+.vscode/
+.idea/
+
+# API anahtarları
+.env
