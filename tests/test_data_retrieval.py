@@ -2,9 +2,8 @@
 """
 Smoke test: Binance veri toplama ajanı
 - HIGH örnek: 5 yıl (BTC)
-- MEDIUM örnek: 2 yıl (ARB)  → 1–3 yıl arası
-- LOW örnek: 0.5 yıl (BTC)   → < 1 yıl
-- Node testi: ETH (5 yıl)
+- MEDIUM örnek: 5 yıl istenir ama ARB'nin geçmişi 1–3 yıl → MEDIUM
+- LOW örnek: 5 yıl istenir ama yeni bir coin <1 yıl → LOW
 """
 
 import pandas as pd
@@ -40,14 +39,7 @@ def run_node(label: str, ticker: str, years: float = 5.0, interval: str = "1d"):
 
 
 if __name__ == "__main__":
-    # HIGH: ≥3 yıl
-    run_case("HIGH", "BTC", 5.0)
-
-    # MEDIUM: 1–3 yıl (ARB ~ 2023’ten beri; ayrıca 2 yıl kısıtlıyoruz)
-    run_case("MEDIUM", "ARB", 2.0)
-
-    # LOW: <1 yıl (aynı sembol olsa da lookback kısıt <1 yıl)
-    run_case("LOW", "BTC", 0.5)
-
-    # Node örneği
-    run_node("NODE", "ETH", 5.0)
+    # Hepsinde lookback_years = 5.0 → gerçek kapsama göre HIGH / MEDIUM / LOW çıkacak
+    run_case("HIGH", "BTC", 5.0)    # ≥3 yıl veri → HIGH
+    run_case("MEDIUM", "ARB", 5.0)  # 1–3 yıl veri → MEDIUM
+    run_case("LOW", "ZRO", 5.0)     # <1 yıl veri → LOW (örnek yeni coin)
