@@ -429,3 +429,72 @@ def forecast_node(state: Dict[str, Any]) -> Dict[str, Any]:
         meta["auto_competitors"] = [m["model"] for _, (_, m) in scores]
 
     return {"forecast_data": yhat, "forecast_meta": meta}
+
+
+
+# --- dosyanın en altına ekle: adapter for router.make(df, cfg) ---------------
+
+def make(df: pd.DataFrame, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Router uyum katmanı.
+    Giriş: df (en az 'close' veya 'Close'), cfg:
+        {
+          "models": ["arima","arimax","ets"],
+          "horizon": 7,
+          "exog": {"cols": [...]}   # ARIMAX için kullanılacak sütunlar
+        }
+    Çıkış: {'arima': Series?, 'arimax': Series?, 'ets': Series?}
+           (Olmayanlar eklenmez. Router'daki model_selection bunların metriklerinden seçecek.)
+    """
+    if df is None or df.empty:
+        return {}
+
+    # 1) Column uyumu: senin fonksiyonların 'Close' bekliyor
+    df2 = df.copy()
+    if "Close" not in df2.columns and "close" in df2.columns:
+        df2["Close"] = df2["close"]
+
+    # 2) Parametreler
+    horizon = int(cfg.get("horizon", 7))
+    models = cfg.get("models", ["arima", "arimax", "ets"])
+    exog_cols = None
+    if isinstance(cfg.get("exog"), dict):
+        exog_cols = cfg["exog"].get("cols")
+
+    # 3) Y serisi ve exog hazırla
+    y = _ensure_series_close(df2)
+    exog = _pick_exog(df2, exog_cols) if exog_cols else None
+
+    out: Dict[str, Any] = {}
+
+    # 4) Modelleri tek tek dene (bağımsız)
+    if "arima" in models:
+        try:
+            yhat, meta = fit_predict_arima(y, horizon=horizon, order=None)
+            out["arima"] = yhat
+            out.setdefault("_meta", {})["arima"] = meta
+        except Exception:
+            pass
+
+    if "arimax" in models:
+        try:
+            if exog is None:
+                # exog yoksa ARIMA'ya düş
+                yhat, meta = fit_predict_arima(y, horizon=horizon, order=None)
+                meta["note"] = "exog bulunamadı → ARIMA'ya düşüldü"
+            else:
+                yhat, meta = fit_predict_arimax(y, exog=exog, horizon=horizon, order=None, exog_cols=exog_cols)
+            out["arimax"] = yhat
+            out.setdefault("_meta", {})["arimax"] = meta
+        except Exception:
+            pass
+
+    if "ets" in models:
+        try:
+            yhat, meta = fit_predict_ets(y, horizon=horizon)
+            out["ets"] = yhat
+            out.setdefault("_meta", {})["ets"] = meta
+        except Exception:
+            pass
+
+    return out
