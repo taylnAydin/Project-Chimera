@@ -1,59 +1,58 @@
-# agents/notifier.py
+# -*- coding: utf-8 -*-
 """
-Chimera • Notifier Agent
-- Reporter tarafından üretilen raporu kullanıcıya ulaştırır.
-- Şu anda iki şey yapıyor:
-  1) Konsola yazdırır.
-  2) data/reports/ klasörüne .md dosyası olarak kaydeder.
+Notifier Agent
+- Reporter'dan gelen raporu (title, body, path, symbol, run_id) kanallara iletir.
+- Eğer reporter zaten diske yazdıysa tekrar yazmaz; sadece konumu bildirir.
+- path yoksa symbol/run_id ile güvenli bir dosya adı oluşturup kaydeder.
 """
 
 from __future__ import annotations
+from typing import Dict, Any, Optional
 import os
-from typing import Dict, Any
 from datetime import datetime
 
-def _ensure_reports_dir(path: str = "data/reports") -> str:
-    """data/reports klasörü yoksa oluşturur, yolunu döner."""
-    if not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
+def _ensure_reports_dir() -> str:
+    path = os.path.join("data", "reports")
+    os.makedirs(path, exist_ok=True)
     return path
 
-def send(report: Dict[str, Any], cfg: Dict[str, Any] | None = None) -> None:
-    """
-    Raporu konsola yaz ve data/reports klasörüne kaydet.
+def _safe_filename(symbol: Optional[str], run_id: Optional[str]) -> str:
+    sym = (symbol or "UNKNOWN").upper()
+    rid = run_id or datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    return f"{sym}_run_{rid}.md"
 
+def send(report: Dict[str, Any], cfg: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """
     Args:
-        report: reporter.build çıktısı. Beklenen alanlar:
-            - report["title"]: str
-            - report["body"]: str (Markdown içeriği)
-            - report["meta"]: dict (symbol, run_id, vs.)
-        cfg: opsiyonel config (şimdilik kullanılmıyor).
+        report: reporter.build(...) çıktısı (title, body, path, symbol, run_id içerir)
+        cfg: kanal ayarları (şimdilik kullanılmıyor)
+
+    Behavior:
+        - path varsa tekrar yazmaz; sadece bildirir.
+        - path yoksa data/reports altında symbol/run_id ile kaydeder.
     """
-    if not report:
-        print("[notifier] Uyarı: boş rapor alındı.")
-        return
+    cfg = cfg or {}
+    title  = report.get("title") or "Chimera Raporu"
+    body   = report.get("body") or ""
+    path   = report.get("path")  # reporter zaten yazdıysa dolu olur
+    symbol = report.get("symbol") or cfg.get("symbol")
+    run_id = report.get("run_id") or cfg.get("run_id")
 
-    title = report.get("title", "Chimera Raporu")
-    body  = report.get("body", "")
-    meta  = report.get("meta", {})
-
-    # 1) Konsola yaz
-    print("="*80)
+    banner = "=" * 80
+    print(banner)
     print(f"[Chimera Notifier] {title}")
-    print("="*80)
-    print(body)
-    print("="*80)
+    print(banner)
 
-    # 2) Dosyaya kaydet
-    reports_dir = _ensure_reports_dir("data/reports")
-    symbol = meta.get("symbol", "UNKNOWN")
-    run_id = meta.get("run_id", datetime.utcnow().strftime("%Y%m%d%H%M%S"))
-    filename = f"{symbol}_run_{run_id}.md"
+    if path and os.path.isfile(path):
+        # Reporter yazmış → sadece duyur
+        print(f"[notifier] Rapor zaten kaydedildi: {path}\n")
+        return {"ok": True, "path": path, "symbol": symbol, "run_id": run_id}
 
-    filepath = os.path.join(reports_dir, filename)
-    try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(body)
-        print(f"[notifier] Rapor kaydedildi: {filepath}")
-    except Exception as e:
-        print(f"[notifier] Rapor dosyaya yazılamadı: {e}")
+    # Reporter path vermemişse biz kaydedelim
+    reports_dir = _ensure_reports_dir()
+    filename = _safe_filename(symbol, run_id)
+    out_path = os.path.join(reports_dir, filename)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(body)
+    print(f"[notifier] Rapor kaydedildi: {out_path}\n")
+    return {"ok": True, "path": out_path, "symbol": symbol, "run_id": run_id}

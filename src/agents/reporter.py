@@ -302,4 +302,11 @@ def build(
         "has_llm": str(os.getenv("REPORTER_USE_LLM", "false")).lower() == "true",
     }
 
-    return {"title": title, "body": body_final, "path": file_path, "meta": meta}
+    return {
+        "title": title,
+        "body": body_final,
+        "path": file_path,
+        "meta": meta,
+        "symbol": symbol,
+        "run_id": run_id,
+    }
