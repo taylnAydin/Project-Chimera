@@ -15,18 +15,18 @@ from uuid import uuid4
 from langgraph.graph import StateGraph, START, END
 
 # --- Agent modülleri ---
-import agents.data_retrieval as data_retrieval
-import agents.indicator as indicator
-import agents.data_quality as data_quality
-import agents.guardrails_agent as guardrails
-import agents.forecast as forecast
-import agents.model_selection as model_selection
-import agents.regime_detector as regime_detector
-import agents.risk as risk
-import agents.persistence as persistence
-import agents.reporter as reporter
-import agents.notifier as notifier
-import agents.backtester as backtester  # <-- yeni: backtester
+from . import data_retrieval as data_retrieval
+from . import indicator as indicator
+from . import data_quality as data_quality
+from . import guardrails_agent as guardrails
+from . import forecast as forecast
+from . import model_selection as model_selection
+from . import regime_detector as regime_detector
+from . import risk as risk
+from . import persistence as persistence
+from . import reporter as reporter
+from . import notifier as notifier
+from . import backtester as backtester
 
 # (Opsiyonel) anomaly mevcut değilse no-op
 try:

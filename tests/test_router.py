@@ -1,6 +1,8 @@
 # tests/test_router.py
 import os
 from src.agents.router import run_router
+from datetime import date
+
 
 # İlk denemede LLM kapalı tutalım; rapor yine üretilecek (fallback).
 # .env içinde REPORTER_USE_LLM=false olmalı.
@@ -78,7 +80,7 @@ cfg = {
 if __name__ == "__main__":
     symbol = "BTCUSDT"
     start = "2021-01-01"
-    end   = "2025-01-01"
+    end = str(date.today())  
 
     final = run_router(symbol, start, end, cfg)
 

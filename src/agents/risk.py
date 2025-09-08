@@ -216,3 +216,126 @@ def risk_node(state: Dict[str, Any]) -> Dict[str, Any]:
         confidence=state.get("confidence"),
     )
     return {"risk_plan": plan, "risk_meta": meta}
+
+
+def plan(best: Dict[str, Any], regime: Dict[str, Any] | str, cfg: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """
+    Router'ın çağırdığı adapter.
+    analyzed_data verilmediği için fiyat ve ATR'yi yaklaşıkla:
+
+    - Fiyat: cfg["entry_price"] varsa onu kullan; yoksa best["yhat"]'ın ilk değerini giriş fiyatı say.
+    - ATR yaklaşığı: regime["vol_annualized"] (yıllık σ) → günlük σ_d ≈ σ_ann / sqrt(252)
+                     ATR ≈ k * price * σ_d (k~1.0). cfg["atr_k"] ile değiştirilebilir.
+
+    Risk politikası:
+      - _regime_policy(...) ile yön ve stop/tp ATR katsayıları.
+      - Hesap riski: equity * risk_per_trade * base_risk_mult * confidence_mult
+
+    Args:
+        best: model_selection.pick(...) çıktısı; {"yhat": pd.Series, ...}
+        regime: regime_detector.detect(...) çıktısı veya string (örn. "bull_high_vol")
+        cfg: {
+          "entry_price": float (opsiyonel),
+          "account_equity": 10000.0,
+          "risk_per_trade": 0.01,
+          "atr_k": 1.0,
+          "direction_override": "long"|"short"|None
+        }
+
+    Returns:
+        dict: risk_plan (build_risk_plan ile aynı alanlar)
+    """
+    cfg = cfg or {}
+    # 1) Fiyat
+    price = cfg.get("entry_price")
+    if price is None:
+        yhat = (best or {}).get("yhat", None)
+        try:
+            # pd.Series ise ilk tahmini al
+            price = float(yhat.iloc[0])  # type: ignore[attr-defined]
+        except Exception:
+            # meta'da bir şey yoksa vazgeçme
+            price = None
+
+    # 2) Rejimi stringe çevir + vol al
+    if isinstance(regime, dict):
+        regime_str = regime.get("trend", "sideway") + "_" + ("high_vol" if regime.get("vol_class") == "extreme" else regime.get("vol_class", "normal"))
+        vol_ann = float(regime.get("vol_annualized", 0.3))  # kaba varsayım
+        confidence = None
+    else:
+        regime_str = str(regime)
+        vol_ann = 0.3
+        confidence = None
+
+    # 3) ATR yaklaşık
+    # σ_d ≈ σ_ann / sqrt(252) ; ATR ≈ k * price * σ_d
+    import math
+    atr_k = float(cfg.get("atr_k", 1.0))
+    if price is None:
+        # hiçbir fiyat bulamadıysak makul bir default
+        price = float(best.get("meta", {}).get("last_price", 0.0)) if isinstance(best.get("meta"), dict) else 0.0
+        if price <= 0:
+            # son çare: yhat ortalaması
+            yhat = (best or {}).get("yhat", None)
+            try:
+                price = float(getattr(yhat, "mean")())
+            except Exception:
+                raise ValueError("risk.plan: entry_price tahmin edilemedi; cfg['entry_price'] sağlayın.")
+
+    sigma_d = vol_ann / math.sqrt(252.0) if vol_ann and vol_ann > 0 else 0.02  # %2 günlük varsayım
+    atr_approx = max(1e-9, atr_k * price * sigma_d)
+
+    # 4) Politika + yön
+    pol = _regime_policy(regime_str)
+    if cfg.get("direction_override") in ("long", "short"):
+        pol["direction"] = cfg["direction_override"]
+
+    # Eğer yön belirlenmediyse ve best yhat pozitif sapma gösteriyorsa long'a bias:
+    try:
+        yhat = best.get("yhat", None)
+        if yhat is not None:
+            exp_ret = (float(getattr(yhat, "iloc")[ -1 ]) - float(getattr(yhat, "iloc")[ 0 ])) / float(getattr(yhat, "iloc")[ 0 ])
+            if exp_ret < 0:
+                pol["direction"] = "short"
+            else:
+                pol["direction"] = "long"
+    except Exception:
+        pass
+
+    # 5) Risk bütçesi
+    equity = float(cfg.get("account_equity", 10_000.0))
+    risk_pct = float(cfg.get("risk_per_trade", 0.01))
+    conf_mult = _confidence_mult(confidence)
+    risk_pct_eff = risk_pct * float(pol["base_risk_mult"]) * conf_mult
+    risk_dollars = equity * risk_pct_eff
+
+    # 6) Stop/TP
+    stop_dist = float(pol["stop_atr_mult"]) * atr_approx
+    tp_dist   = float(pol["tp_atr_mult"]) * atr_approx
+
+    units = risk_dollars / max(1e-9, stop_dist)
+    notional = units * price
+    min_pos = float(cfg.get("min_pos_notional", 10.0))
+    if notional < min_pos:
+        units = 0.0
+        notional = 0.0
+
+    if pol["direction"] == "long":
+        stop_price = price - stop_dist
+        tp_price   = price + tp_dist
+    else:
+        stop_price = price + stop_dist
+        tp_price   = price - tp_dist
+
+    return {
+        "direction": pol["direction"],
+        "price": float(price),
+        "units": float(units),
+        "notional": float(notional),
+        "risk_pct_effective": float(risk_pct_eff),
+        "stop_price": float(stop_price),
+        "take_profit_price": float(tp_price),
+        "atr": float(atr_approx),
+        "atr_window": int(cfg.get("atr_window", 14)),
+        "note": f"router_adapter ({pol['note']})",
+    }

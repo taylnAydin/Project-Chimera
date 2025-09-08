@@ -280,3 +280,53 @@ def data_retrieval_node(state: Dict[str, Any]) -> Dict[str, Any]:
         interval=interval,
     )
     return {"raw_data": df, "meta": meta}
+
+def _to_date(x: Any) -> dt.date:
+    if isinstance(x, dt.date):
+        return x
+    return pd.to_datetime(x).date()
+
+def _years_between(start_date: dt.date, end_date: dt.date) -> float:
+    days = (end_date - start_date).days
+    # 0 gelirse Binance en az 1 gün verisine denk getirmek için küçük bir tampon verelim
+    return max(0.01, days / 365.25)
+
+def fetch(symbol: str, start: str, end: str, source_cfg: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    """
+    Router uyumlu giriş noktası.
+    Args:
+      symbol: "BTC" veya "BTCUSDT"
+      start, end: "YYYY-MM-DD"
+      source_cfg: {"interval": "1d", ...} (şimdilik interval'ı alıyoruz)
+
+    Returns:
+      pd.DataFrame (index=DatetimeIndex, cols: hem Büyük harf hem küçük harf OHLCV)
+    """
+    cfg = source_cfg or {}
+    interval = str(cfg.get("interval", "1d"))
+
+    s_date = _to_date(start)
+    e_date = _to_date(end)
+    years = _years_between(s_date, e_date)
+
+    # Mevcut fonksiyonunu kullan
+    df, _meta = get_stock_data(
+        ticker=symbol,
+        lookback_years=years,
+        interval=interval,
+        end_date=e_date,
+    )
+
+    # İstenilen aralığa kırp (güvenli)
+    try:
+        df = df.loc[(df.index.date >= s_date) & (df.index.date <= e_date)]
+    except Exception:
+        pass
+
+    # Pipeline’daki diğer ajanlar için küçük harf kolonları da ekle
+    for C in ["Open", "High", "Low", "Close", "Volume"]:
+        c = C.lower()
+        if C in df.columns and c not in df.columns:
+            df[c] = df[C]
+
+    return df

@@ -247,3 +247,127 @@ def data_quality_node(state: Dict[str, Any]) -> Dict[str, Any]:
         meta=state.get("meta"),
     )
     return {"quality_report": rep, "quality_flags": rep["quality_flags"]}
+
+def _years_span(df: pd.DataFrame) -> float:
+    """
+    DataFrame'in tarih aralığını yıl cinsinden hesaplar.
+
+    Args:
+        df (pd.DataFrame): DateTimeIndex'e sahip OHLCV verisi.
+
+    Returns:
+        float: Veri kapsamının yıllık uzunluğu. Index uygun değilse 0.0.
+    """
+    if isinstance(df.index, pd.DatetimeIndex) and len(df.index) > 1:
+        days = (df.index.max() - df.index.min()).days
+        return max(0.0, days / 365.25)
+    return 0.0
+
+
+def _coverage_class(years: float) -> str:
+    """
+    Yıllık kapsama uzunluğunu kalite sınıfına dönüştürür.
+
+    Args:
+        years (float): Veri kapsama uzunluğu (yıl).
+
+    Returns:
+        str: "low" (<1y), "medium" (1–3y), "high" (≥3y).
+    """
+    if years >= 3.0:
+        return "high"
+    if years >= 1.0:
+        return "medium"
+    return "low"
+
+
+def _duplicate_ratio(df: pd.DataFrame) -> float:
+    """
+    Index'te tekrarlanan zaman damgalarının oranını hesaplar.
+
+    Args:
+        df (pd.DataFrame): DateTimeIndex'e sahip OHLCV verisi.
+
+    Returns:
+        float: Duplicate oranı [0.0–1.0].
+    """
+    if isinstance(df.index, pd.DatetimeIndex) and len(df.index) > 0:
+        dups = int(df.index.duplicated().sum())
+        return dups / float(len(df.index))
+    return 0.0
+
+
+def _gap_ratio_daily(df: pd.DataFrame) -> Optional[float]:
+    """
+    Günlük veride eksik takvim günlerinin oranını hesaplar.
+
+    Args:
+        df (pd.DataFrame): DateTimeIndex'e sahip OHLCV verisi.
+
+    Returns:
+        float | None: Eksik gün oranı; günlük değilse None.
+    """
+    if not isinstance(df.index, pd.DatetimeIndex) or len(df.index) < 2:
+        return None
+    full = pd.date_range(df.index.min().normalize(), df.index.max().normalize(), freq="D")
+    missing = len(set(full) - set(df.index.normalize()))
+    return missing / float(len(full)) if len(full) > 0 else None
+
+
+def evaluate(df: pd.DataFrame, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Router'ın çağırdığı kalite değerlendirme fonksiyonu.
+
+    İçeride `check_data_quality` çalıştırır ve guardrails için özet
+    metrikleri döner.
+
+    Args:
+        df (pd.DataFrame): OHLCV DataFrame (DateTimeIndex zorunlu).
+        cfg (dict | None): Opsiyonel eşikler. Örn:
+            {
+              "z_thr": 5.0,
+              "zero_vol_thr": 0.05,
+              "na_thr": 0.01,
+              "meta": {...}
+            }
+
+    Returns:
+        dict: {
+          "severity": str,
+          "is_ok": bool,
+          "flags": dict,
+          "nan_ratio_max": float,
+          "duplicate_ratio": float,
+          "coverage_years": float,
+          "coverage_class": str,
+          "gap_ratio": float|None,
+          "outlier_count": int,
+          "zero_volume_ratio": float|None,
+          "report": dict   # check_data_quality çıktısı
+        }
+    """
+    cfg = cfg or {}
+    rep = check_data_quality(
+        df,
+        z_thr=float(cfg.get("z_thr", 5.0)),
+        zero_vol_thr=float(cfg.get("zero_vol_thr", 0.05)),
+        na_thr=float(cfg.get("na_thr", 0.01)),
+        meta=cfg.get("meta"),
+    )
+
+    nan_ratio_max = max((rep.get("na_ratio_per_col") or {}).values() or [0.0])
+    years = _years_span(df)
+    qual = {
+        "severity": rep.get("severity"),
+        "is_ok": bool(rep.get("is_ok", False)),
+        "flags": rep.get("quality_flags", {}),
+        "nan_ratio_max": float(nan_ratio_max),
+        "duplicate_ratio": float(_duplicate_ratio(df)),
+        "coverage_years": float(years),
+        "coverage_class": _coverage_class(years),
+        "gap_ratio": _gap_ratio_daily(df),
+        "outlier_count": int((rep.get("return_outliers") or {}).get("count", 0)),
+        "zero_volume_ratio": rep.get("zero_volume_ratio"),
+        "report": rep,
+    }
+    return qual

@@ -1,24 +1,32 @@
 # -*- coding: utf-8 -*-
 """
 Persistence Agent (SQLite)
-- Hibrit kalıcılık: pipeline çıktılarının SQLite'e yazılması.
-- Basit API: open_db, init_db_if_needed, save_run, save_* yardımcıları.
-- LangGraph uyumlu persistence_node (opsiyonel).
+==========================
 
-Tablolar, proje kökünde oluşturduğun "chimera.db" içindeki DDL ile uyumludur.
+- DB varsayılanı: <project_root>/data/chimera.db  (tek dosya, her run aynı dosyada)
+- ENV override:   CHIMERA_DB=/abs/path/to/chimera.db
+- Kolay API: open_db, init_db_if_needed, save_run, save_* yardımcıları
+- Router köprüsü: run_start/artifacts/backtest/run_end event logları
+- LangGraph uyumu: persistence_node(state) (opsiyonel)
+
+Not: Tablo şemasını dışarıdan yönetiyorsan, init_db_if_needed() şu an no-op.
+Sadece events tabloyu otomatik oluşturuyoruz (log amaçlı).
 """
 
 from __future__ import annotations
 from typing import Dict, Any, Optional, Iterable, Tuple
+
 import os
 import json
 import sqlite3 as sq
-import pandas as pd
 from datetime import datetime
 
-# ---------------------------------------------------------------------------
+import pandas as pd
+
+
+# -----------------------------------------------------------------------------
 # Konum & Bağlantı
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 def _project_root() -> str:
     # .../src/agents/persistence.py -> proje kökü
@@ -26,33 +34,46 @@ def _project_root() -> str:
     return os.path.abspath(os.path.join(here, "..", ".."))
 
 def _default_db_path() -> str:
+    """
+    Varsayılan DB yolu:
+      - ENV CHIMERA_DB varsa onu kullan (klasörünü de oluştur)
+      - Yoksa <project_root>/data/chimera.db (data klasörünü oluştur)
+    """
     env = os.getenv("CHIMERA_DB")
     if env:
-        return env
-    return os.path.join(_project_root(), "chimera.db")
+        abs_env = os.path.abspath(env)
+        os.makedirs(os.path.dirname(abs_env), exist_ok=True)
+        return abs_env
+
+    data_dir = os.path.join(_project_root(), "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, "chimera.db")
 
 DB_PATH = _default_db_path()
 
 def open_db(db_path: Optional[str] = None) -> sq.Connection:
     """
     SQLite bağlantısını açar ve foreign_keys'i aktif eder.
+    Dosya/klasör garantisi vardır.
     """
-    path = db_path or DB_PATH
+    path = os.path.abspath(db_path or DB_PATH)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     conn = sq.connect(path)
     conn.execute("PRAGMA foreign_keys = ON;")
     return conn
 
 def init_db_if_needed(conn: sq.Connection) -> None:
     """
-    Şema dışarıdan yüklendi varsayımıyla sadece foreign_keys'i garanti eder.
-    İstersen buraya DDL'yi de gömebilirsin; şimdilik no-op.
+    Şemayı dışarıdan yönetiyorsan burada sadece foreign_keys'i garanti ediyoruz.
+    Dilersen DDL oluşturmayı buraya ekleyebilirsin.
     """
     conn.execute("PRAGMA foreign_keys = ON;")
     conn.commit()
 
-# ---------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
 # Yardımcı dönüşümler
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 def _bool(x: Any) -> int:
     return int(bool(x))
@@ -63,9 +84,10 @@ def _safe_json(obj: Any) -> str:
     except Exception:
         return str(obj)
 
-# ---------------------------------------------------------------------------
-# Kayıtlayıcılar
-# ---------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Kayıtlayıcılar (ana tablolar)
+# -----------------------------------------------------------------------------
 
 def save_run(
     conn: sq.Connection,
@@ -73,19 +95,13 @@ def save_run(
     ticker: str,
     lookback_years: Optional[float] = None,
     confidence: Optional[str] = None,   # "high"|"medium"|"low"
-    regime: Optional[str] = None,       # "bull_high_vol" vs.
+    regime: Optional[str] = None,       # ör. "bull_high_vol"
     risk_note: Optional[str] = None,
     timestamp: Optional[str] = None,    # ISO; None -> CURRENT_TIMESTAMP
 ) -> int:
     """
     runs tablosuna bir satır ekler ve run_id döndürür.
     """
-    if timestamp is None:
-        # SQLite tarafına bırakmak yerine burada ISO üretmek istersen:
-        # timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        # Ama DEFAULT CURRENT_TIMESTAMP da yeterli.
-        pass
-
     cur = conn.cursor()
     if timestamp is None:
         cur.execute(
@@ -121,7 +137,8 @@ def save_snapshots(
         raise ValueError("save_snapshots: analyzed_df.index DatetimeIndex olmalı.")
 
     cols = analyzed_df.columns
-    def pick(c: str) -> Optional[float]:
+
+    def pick(dt, c: str) -> Optional[float]:
         return float(analyzed_df.at[dt, c]) if c in cols and pd.notna(analyzed_df.at[dt, c]) else None
 
     rows: list[Tuple] = []
@@ -130,9 +147,9 @@ def save_snapshots(
         rows.append((
             run_id,
             date_str,
-            pick("Open"), pick("High"), pick("Low"), pick("Close"), pick("Volume"),
-            pick("SMA_14"), pick("SMA_50"), pick("EMA_12"), pick("EMA_26"),
-            pick("RSI_14"), pick("MACD_line"), pick("BB_upper"), pick("BB_middle"), pick("BB_lower"),
+            pick(dt, "Open"), pick(dt, "High"), pick(dt, "Low"), pick(dt, "Close"), pick(dt, "Volume"),
+            pick(dt, "SMA_14"), pick(dt, "SMA_50"), pick(dt, "EMA_12"), pick(dt, "EMA_26"),
+            pick(dt, "RSI_14"), pick(dt, "MACD_line"), pick(dt, "BB_upper"), pick(dt, "BB_middle"), pick(dt, "BB_lower"),
         ))
 
     cur = conn.cursor()
@@ -253,17 +270,19 @@ def save_quality_report(
     conn.commit()
     return int(cur.lastrowid)
 
-# ---------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
 # LangGraph düğümü (opsiyonel)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 def persistence_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """
     Pipeline state'inden kalıcılaşacak parçaları alır ve DB'ye yazar.
-    Beklenenler (hepsi zorunlu değil; olanı kaydeder):
+
+    Beklenen (hepsi zorunlu değil; olanı kaydeder):
       - ticker (str), lookback_years (float), meta (data_retrieval)
       - analyzed_data (pd.DataFrame)
-      - forecast_data / forecast_meta  (ya da candidates)
+      - forecast_data / forecast_meta
       - risk_plan
       - quality_report
       - regime / regime_meta
@@ -321,3 +340,97 @@ def persistence_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     conn.close()
     return {"run_id": run_id}
+
+
+# -----------------------------------------------------------------------------
+# Router uyumluluk köprüsü (events tablosu)
+# -----------------------------------------------------------------------------
+
+def _ensure_events_table(conn: sq.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts       TEXT     NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+            type     TEXT     NOT NULL,
+            run_id   TEXT,
+            symbol   TEXT,
+            payload  TEXT
+        )
+    """)
+    conn.commit()
+
+def _append_event(event_type: str, run_id: str | None, symbol: str | None, payload: Dict[str, Any]) -> None:
+    conn = open_db()
+    try:
+        _ensure_events_table(conn)
+        conn.execute(
+            "INSERT INTO events(type, run_id, symbol, payload) VALUES (?,?,?,?)",
+            (event_type, run_id, symbol, _safe_json(payload)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def save_run_start(run_id: str, symbol: str, cfg: Dict[str, Any]) -> None:
+    """
+    Router 'start' node'unda çağrılır.
+    Basitçe events tablosuna log atar. İstersek burada save_run(...) da çağırabiliriz.
+    """
+    _append_event("run_start", run_id, symbol, {"cfg": cfg})
+
+def save_run_artifacts(
+    run_id: str,
+    symbol: str,
+    df: Any,
+    quality: Dict[str, Any],
+    forecasts: Dict[str, Any],
+    best: Dict[str, Any],
+    regime: Dict[str, Any],
+    risk_plan: Dict[str, Any],
+    anomalies: Any,
+    mode: str,
+    halt_reason: Optional[str] = None,
+) -> None:
+    """Ajan çıktılarının özetini events tablosuna yazar."""
+    try:
+        df_len = int(len(df)) if df is not None else 0
+    except Exception:
+        df_len = 0
+
+    try:
+        forecast_keys = list((forecasts or {}).keys())
+        if "_meta" in forecast_keys:
+            forecast_keys.remove("_meta")
+    except Exception:
+        forecast_keys = []
+
+    try:
+        anomalies_count = len(anomalies or [])
+    except Exception:
+        anomalies_count = 0
+
+    payload = {
+        "mode": mode,
+        "halt_reason": halt_reason,
+        "df_len": df_len,
+        "forecast_keys": forecast_keys,
+        "quality": quality or {},
+        "best": best or {},
+        "regime": regime or {},
+        "risk_plan": risk_plan or {},
+        "anomalies_count": anomalies_count,
+    }
+    _append_event("artifacts", run_id, symbol, payload)
+
+def save_backtest(run_id: str, symbol: str, backtest: Dict[str, Any]) -> None:
+    """Backtest özetini events tablosuna yazar."""
+    payload = {
+        "metrics": (backtest or {}).get("metrics"),
+        "trades_n": len((backtest or {}).get("trades") or []),
+        "equity_n": len((backtest or {}).get("equity") or []),
+    }
+    _append_event("backtest", run_id, symbol, payload)
+
+def save_run_end(run_id: str, status: str, error: Optional[str] = None) -> None:
+    """Run bitiş kaydı (success/failed)."""
+    _append_event("run_end", run_id, None, {"status": status, "error": error})

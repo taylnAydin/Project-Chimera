@@ -287,3 +287,129 @@ def indicator_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     analyzed, meta = calculate_indicators(raw, use_pandas_ta=use_pta, config=cfg)
     return {"analyzed_data": analyzed, "indicator_meta": meta}
+
+
+def _ensure_ohlcv_lower_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """Close/High/Low/Open/Volume için küçük harf kopyaları ekle."""
+    out = df.copy()
+    for C in ["Open", "High", "Low", "Close", "Volume"]:
+        c = C.lower()
+        if C in out.columns and c not in out.columns:
+            out[c] = out[C]
+        if c in out.columns and C not in out.columns:
+            out[C] = out[c]
+    return out
+
+def _parse_periods(x: Any) -> list[int]:
+    """cfg içinde hem [14] hem {'period':14} yazımlarını destekle."""
+    if x is None:
+        return []
+    if isinstance(x, dict):
+        if "period" in x: return [int(x["period"])]
+        if "length" in x: return [int(x["length"])]
+        return []
+    if isinstance(x, (list, tuple)):
+        return [int(v) for v in x]
+    # tek sayı gelirse
+    try:
+        return [int(x)]
+    except Exception:
+        return []
+
+def _compute_atr(df: pd.DataFrame, period: int) -> pd.Series:
+    """Basit ATR (rolling mean of True Range)."""
+    high, low, close = df["High"], df["Low"], df["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period, min_periods=period).mean()
+
+def enrich(df: Any, cfg: Dict[str, Any] | None = None) -> Any:
+    """
+    Router çağrısı için adapter.
+    cfg ör.: {
+      "sma": [20, 50],
+      "ema": [21],
+      "rsi": {"period":14, "colname":"rsi_14"},
+      "macd": {"fast":12,"slow":26,"signal":9},
+      "bb": {"period":20, "std":2.0},
+      "atr": {"period":14, "colname":"atr_14"}
+    }
+    """
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return df
+
+    cfg = cfg or {}
+    df2 = _ensure_ohlcv_lower_aliases(df)
+
+    # calculate_indicators için konfigürasyonu dönüştür
+    cfg_ci: Dict[str, Any] = {}
+    # SMA / EMA / RSI listelerini yakala
+    sma_ps = _parse_periods(cfg.get("sma"))
+    ema_ps = _parse_periods(cfg.get("ema"))
+    # RSI hem liste hem dict olabilir
+    rsi_block = cfg.get("rsi")
+    rsi_ps = _parse_periods(rsi_block)
+
+    if sma_ps: cfg_ci["sma"] = sma_ps
+    if ema_ps: cfg_ci["ema"] = ema_ps
+    if rsi_ps: cfg_ci["rsi"] = rsi_ps
+    if "macd" in cfg: cfg_ci["macd"] = cfg.get("macd") or {}
+
+    # bb → bbands dönüştür
+    if "bb" in cfg:
+        bb = cfg["bb"] or {}
+        cfg_ci["bbands"] = {
+            "length": int(bb.get("period", bb.get("length", 20))),
+            "stdev": float(bb.get("std", bb.get("stdev", 2.0))),
+        }
+
+    # Göstergeleri ekle (pandas_ta varsa otomatik kullanır)
+    analyzed, meta = calculate_indicators(df2, use_pandas_ta=None, config=cfg_ci)
+
+    # ATR istenmişse ayrıca hesapla
+    atr_cfg = cfg.get("atr") or {}
+    if atr_cfg:
+        atr_p = int(atr_cfg.get("period", 14))
+        atr_name = atr_cfg.get("colname", f"atr_{atr_p}")
+        analyzed[atr_name] = _compute_atr(analyzed, atr_p)
+
+    # EXOG için küçük harf alias'ları ekle (rsi_14, ema_21 vb.)
+    for p in ema_ps:
+        up = f"EMA_{p}"
+        lo = f"ema_{p}"
+        if up in analyzed.columns and lo not in analyzed.columns:
+            analyzed[lo] = analyzed[up]
+    for p in rsi_ps:
+        up = f"RSI_{p}"
+        lo = f"rsi_{p}"
+        if up in analyzed.columns and lo not in analyzed.columns:
+            analyzed[lo] = analyzed[up]
+    for p in sma_ps:
+        up = f"SMA_{p}"
+        lo = f"sma_{p}"
+        if up in analyzed.columns and lo not in analyzed.columns:
+            analyzed[lo] = analyzed[up]
+
+    # MACD ve BB zaten lower_snake isimlerle eklendi: MACD_line/BB_upper vb.
+    # İstersen burada da tamamen küçüğe indirebilirsin:
+    if "MACD_line" in analyzed.columns and "macd_line" not in analyzed.columns:
+        analyzed["macd_line"] = analyzed["MACD_line"]
+    if "MACD_signal" in analyzed.columns and "macd_signal" not in analyzed.columns:
+        analyzed["macd_signal"] = analyzed["MACD_signal"]
+    if "MACD_hist" in analyzed.columns and "macd_hist" not in analyzed.columns:
+        analyzed["macd_hist"] = analyzed["MACD_hist"]
+    if "BB_upper" in analyzed.columns and "bb_upper" not in analyzed.columns:
+        analyzed["bb_upper"] = analyzed["BB_upper"]
+    if "BB_middle" in analyzed.columns and "bb_middle" not in analyzed.columns:
+        analyzed["bb_middle"] = analyzed["BB_middle"]
+    if "BB_lower" in analyzed.columns and "bb_lower" not in analyzed.columns:
+        analyzed["bb_lower"] = analyzed["BB_lower"]
+
+    # OHLCV alias'ları da garanti edelim
+    analyzed = _ensure_ohlcv_lower_aliases(analyzed)
+    return analyzed
+

@@ -194,3 +194,139 @@ def regime_node(state: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("regime_node: 'analyzed_data' boş/geçersiz.")
     include_series = bool(state.get("include_series", False))
     return detect_regime(df, include_series=include_series)
+
+"""
+Regime Detector
+===============
+Basit trend + volatilite sınıflandırması.
+
+Çıktı sözlüğü:
+{
+  "trend": "up"|"down"|"flat",
+  "trend_slope": float,          # günlük slope (Close ~ t) * 252 (yıllıklaştırılmış)
+  "vol_class": "low"|"normal"|"extreme",
+  "vol_annualized": float,       # yıllıklaştırılmış std (ret * sqrt(252))
+  "vol_z": float,                # mevcut vol'un geçmişe göre z-skoru
+  "window": int,                 # hesaplamada kullanılan pencere
+  "bounds": { "low_hi": x, "extreme_hi": y },  # eşiklerin sayısal karşılıkları
+  "meta": {...}                  # istemciye ek notlar
+}
+"""
+
+
+
+def _ensure_close(df: pd.DataFrame) -> pd.Series:
+    if "Close" in df.columns:
+        y = pd.to_numeric(df["Close"], errors="coerce")
+    elif "close" in df.columns:
+        y = pd.to_numeric(df["close"], errors="coerce")
+    else:
+        raise ValueError("regime_detector: 'Close' kolonu gerekli.")
+    y = y.dropna()
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("regime_detector: index DatetimeIndex olmalı.")
+    y.index = pd.to_datetime(df.index)
+    y = y.sort_index()
+    if len(y) < 30:
+        raise ValueError("regime_detector: en az 30 gözlem gerekli.")
+    return y
+
+
+def _ols_slope(y: pd.Series, win: int) -> float:
+    """
+    Basit doğrusal trend eğimi: y ~ a + b * t  (t = 0..win-1)
+    Dönüş: günlük b; yıllıklaştırmayı çağıran yapar.
+    """
+    y_win = y.iloc[-win:].astype(float)
+    t = np.arange(len(y_win), dtype=float)
+    t = (t - t.mean()) / (t.std() if t.std() != 0 else 1.0)
+    # OLS slope: cov(t,y) / var(t)
+    b = np.cov(t, y_win, ddof=0)[0, 1] / (np.var(t) if np.var(t) != 0 else 1.0)
+    return float(b)
+
+
+def _vol_annualized(y: pd.Series, win: int) -> float:
+    rets = y.pct_change().dropna()
+    r_win = rets.iloc[-win:]
+    vol_d = float(r_win.std(ddof=0))
+    return vol_d * np.sqrt(252.0)
+
+
+def detect(df: pd.DataFrame, cfg: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Trend & volatilite rejimini tespit eder.
+
+    Args:
+        df: OHLCV DataFrame (DatetimeIndex zorunlu, 'Close' zorunlu).
+        cfg: {
+            "window": 30,                # trend ve vol penceresi
+            "flat_slope_bps": 10.0,      # günlük bps; bunun altında 'flat'
+            "vol_lookback": 252,         # vol z-skoru için referans pencere
+            "vol_low_pctl": 0.33,        # düşük vol yüzdelik
+            "vol_extreme_pctl": 0.90     # extreme vol yüzdelik
+        }
+
+    Returns:
+        dict (bkz. modül docstring)
+    """
+    cfg = cfg or {}
+    win = int(cfg.get("window", 30))
+    flat_bps = float(cfg.get("flat_slope_bps", 10.0))              # 10 bps/gün
+    vol_ref = int(cfg.get("vol_lookback", 252))
+    p_low = float(cfg.get("vol_low_pctl", 0.33))
+    p_ext = float(cfg.get("vol_extreme_pctl", 0.90))
+
+    y = _ensure_close(df)
+
+    # --- Trend (günlük slope → yıllıklaştır, bps)
+    b_daily = _ols_slope(y, win)
+    b_ann = b_daily * 252.0
+    bps_ann = b_ann / (y.iloc[-win:].mean() if y.iloc[-win:].mean() != 0 else 1.0) * 1e4
+
+    if bps_ann > flat_bps:
+        trend = "up"
+    elif bps_ann < -flat_bps:
+        trend = "down"
+    else:
+        trend = "flat"
+
+    # --- Vol (yıllıklaştırılmış)
+    vol_ann = _vol_annualized(y, win)
+
+    # Geçmiş dağılım: son vol_ref günün rolling vol'ları
+    rets = y.pct_change().dropna()
+    roll = rets.rolling(win).std(ddof=0).dropna() * np.sqrt(252.0)
+    hist = roll.iloc[-vol_ref:] if len(roll) >= vol_ref else roll
+    if len(hist) >= 5:
+        low_hi = float(np.quantile(hist.values, p_low))
+        extreme_hi = float(np.quantile(hist.values, p_ext))
+        mu, sd = float(np.mean(hist.values)), float(np.std(hist.values, ddof=0))
+        vol_z = (vol_ann - mu) / (sd if sd != 0 else 1.0)
+    else:
+        # veri azsa kaba eşikler
+        low_hi = float(vol_ann * 0.8)
+        extreme_hi = float(vol_ann * 1.2)
+        vol_z = 0.0
+
+    if vol_ann <= low_hi:
+        vol_class = "low"
+    elif vol_ann >= extreme_hi:
+        vol_class = "extreme"
+    else:
+        vol_class = "normal"
+
+    return {
+        "trend": trend,
+        "trend_slope": float(bps_ann),         # yıllık bps
+        "vol_class": vol_class,
+        "vol_annualized": float(vol_ann),
+        "vol_z": float(vol_z),
+        "window": win,
+        "bounds": {"low_hi": low_hi, "extreme_hi": extreme_hi},
+        "meta": {
+            "flat_slope_bps": flat_bps,
+            "vol_lookback": vol_ref,
+            "pctl_low": p_low,
+            "pctl_extreme": p_ext,
+        },
+    }

@@ -212,3 +212,95 @@ def model_selection_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     sel = select_model(df, exog_cols=exog_cols, val_ratio=val_ratio)
     return {"model_choice": sel["chosen"], "model_scores": sel["scores"]}
+
+def _ms_series_len(x: Any) -> int:
+    """pd.Series için uzunluk, diğer tipler için güvenli len()."""
+    if pd is not None and isinstance(x, pd.Series):
+        return int(len(x))
+    try:
+        return int(len(x))
+    except Exception:
+        return 0
+
+def _score_from_meta(meta: Dict[str, Any], metric: str) -> Tuple[float, bool]:
+    """
+    Meta'dan skor çıkarır.
+    Returns:
+        (score, is_valid)
+    """
+    m = (metric or "rmse").lower()
+    if m == "rmse":
+        val = meta.get("select_rmse", meta.get("rmse", None))
+    elif m == "aic":
+        val = meta.get("aic", None)
+    elif m == "bic":
+        val = meta.get("bic", None)
+    else:
+        # bilinmeyen ölçütte rmse'ye düş
+        val = meta.get("select_rmse", meta.get("rmse", None))
+    if val is None:
+        return (float("inf"), False)
+    return (float(val), True)
+
+def pick(forecasts: Dict[str, Any], metric: str = "rmse") -> Dict[str, Any]:
+    """
+    Router'ın beklediği seçim fonksiyonu.
+
+    Args:
+        forecasts (dict): forecast.make(...) çıktısı gibi bir sözlük:
+            {
+              "arima":  pd.Series,
+              "arimax": pd.Series,
+              "ets":    pd.Series,
+              "_meta": {
+                  "arima":  {...},  # aic/bic/select_rmse vb.
+                  "arimax": {...},
+                  "ets":    {...}
+              }
+            }
+        metric (str): "rmse" (vars), "aic" veya "bic".
+
+    Returns:
+        dict: {
+          "name": "<key>",          # seçilen model adı ("arima"/"arimax"/"ets")
+          "metric": "<metric>",
+          "score": float,           # seçime esas skor
+          "meta": dict,             # modelin meta bilgisi
+          "yhat": pd.Series,        # seçilen öngörü serisi
+          "horizon": int            # adım sayısı
+        }
+    """
+    if not isinstance(forecasts, dict) or not forecasts:
+        return {}
+
+    meta_all = forecasts.get("_meta", {}) or {}
+    candidates = [k for k, v in forecasts.items() if not k.startswith("_") and v is not None]
+    if not candidates:
+        return {}
+
+    best_name: Optional[str] = None
+    best_score: float = float("inf")
+    best_meta: Dict[str, Any] = {}
+    best_series: Any = None
+
+    for name in candidates:
+        series = forecasts.get(name)
+        meta = meta_all.get(name, {}) or {}
+        score, valid = _score_from_meta(meta, metric)
+
+        # meta yoksa/fake ise: deterministik bir fallback uygula
+        # (uzun seri daha iyi kabul edilir; skor = 1/len)
+        if not valid:
+            score = 1.0 / max(1, _ms_series_len(series))
+
+        if score < best_score:
+            best_name, best_score, best_meta, best_series = name, score, meta, series
+
+    return {
+        "name": best_name,
+        "metric": metric,
+        "score": float(best_score),
+        "meta": best_meta,
+        "yhat": best_series,
+        "horizon": _ms_series_len(best_series),
+    }
