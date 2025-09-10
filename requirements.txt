@@ -1,12 +1,8 @@
-transformers
-torch
-scikit-learn
-statsmodels
 pandas
 numpy
-matplotlib
+scikit-learn
+statsmodels
+pandas-ta==0.3.14b0
 langgraph
 python-dotenv
-yfinance==0.2.52
-pandas-ta==0.3.14b0
 langchain-google-genai==2.0.7
