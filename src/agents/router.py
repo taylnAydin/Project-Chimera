@@ -273,7 +273,6 @@ def node_persist(state: ChimeraState) -> ChimeraState:
 
 @with_try("reporter")
 def node_reporter(state: ChimeraState) -> ChimeraState:
-    # Not: reporter.build şimdilik backtest'i almıyor. İstersen ileride ekleriz.
     state["report"] = reporter.build(
         run_id=state["run_id"],
         symbol=state["symbol"],
@@ -283,6 +282,7 @@ def node_reporter(state: ChimeraState) -> ChimeraState:
         quality=state["quality"],
         anomalies=state["anomalies"],
         mode=state["mode"],
+        backtest=state.get("backtest", {}),  
         cfg=state["cfg"].get("report", {})
     )
     return state

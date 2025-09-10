@@ -424,10 +424,18 @@ def save_run_artifacts(
 
 def save_backtest(run_id: str, symbol: str, backtest: Dict[str, Any]) -> None:
     """Backtest özetini events tablosuna yazar."""
+    metrics = (backtest or {}).get("metrics") or {}
+
+    trades = (backtest or {}).get("trades")
+    equity = (backtest or {}).get("equity")
+
+    trades_n = int(len(trades)) if trades is not None else 0
+    equity_n = int(len(equity)) if equity is not None else 0
+
     payload = {
-        "metrics": (backtest or {}).get("metrics"),
-        "trades_n": len((backtest or {}).get("trades") or []),
-        "equity_n": len((backtest or {}).get("equity") or []),
+        "metrics": metrics,
+        "trades_n": trades_n,
+        "equity_n": equity_n,
     }
     _append_event("backtest", run_id, symbol, payload)
 

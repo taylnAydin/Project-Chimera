@@ -16,6 +16,7 @@ Kullanım (router içinde):
         quality=state["quality"],
         anomalies=state["anomalies"],
         mode=state["mode"],
+        backtest=state.get("backtest"),     # <-- opsiyonel: eklendi
         cfg=state["cfg"].get("report", {})
     )
 """
@@ -25,8 +26,15 @@ from typing import Dict, Any, Optional, List
 import os
 import textwrap
 from datetime import datetime
-
+from pathlib import Path
 import pandas as pd
+
+try:
+    from dotenv import load_dotenv
+    # Proje kökünde .env var sayıyoruz: .../src/agents/reporter.py -> ../../.env
+    load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
+except Exception:
+    pass
 
 # -----------------------------------------------------------------------------
 # Gemini opsiyonel bağlama
@@ -34,12 +42,20 @@ import pandas as pd
 
 def _maybe_gemini_polish(markdown_text: str, cfg: Dict[str, Any]) -> str:
     """
-    REPORTER_USE_LLM=true ve GEMINI_API_KEY varsa teksit parlatmayı dener.
+    REPORTER_USE_LLM=true ve GEMINI_API_KEY varsa metni parlatmayı dener.
     Hata olursa orijinal metni geri döner.
     """
-    use_llm = str(os.getenv("REPORTER_USE_LLM", "false")).lower() == "true" or bool(cfg.get("use_llm"))
+    # 1) bayrakları topla
+    use_llm_env = str(os.getenv("REPORTER_USE_LLM", "false")).lower() == "true"
+    use_llm_cfg = bool(cfg.get("use_llm"))
+    use_llm = use_llm_env or use_llm_cfg
+
     api_key = os.getenv("GEMINI_API_KEY") or cfg.get("gemini_api_key")
     model_name = cfg.get("gemini_model", "gemini-1.5-flash")
+
+    # 2) debug log (değişkenler tanımlandıktan SONRA)
+    print(f"[reporter] Gemini polish enabled? {use_llm and bool(api_key)} "
+          f"(use_llm={use_llm}, has_key={bool(api_key)})")
 
     if not (use_llm and api_key):
         return markdown_text
@@ -54,11 +70,9 @@ def _maybe_gemini_polish(markdown_text: str, cfg: Dict[str, Any]) -> str:
         model = genai.GenerativeModel(model_name)
         resp = model.generate_content([sys_prompt, markdown_text])
         polished = (resp.text or "").strip()
-        if polished:
-            return polished
-        return markdown_text
-    except Exception:
-        # LLM başarısızsa sessizce fallback
+        return polished if polished else markdown_text
+    except Exception as e:
+        print(f"[reporter] Gemini polish error: {e}")
         return markdown_text
 
 # -----------------------------------------------------------------------------
@@ -100,6 +114,36 @@ def _ensure_reports_dir() -> str:
     os.makedirs(path, exist_ok=True)
     return path
 
+def _bt_metrics_table(metrics: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(metrics, dict) or not metrics:
+        return "- veri yok -"
+    rows = [
+        ("İşlem Sayısı", metrics.get("trades")),
+        ("Kazanma Oranı", _fmt_pct(metrics.get("win_rate"))),
+        ("Toplam Getiri", _fmt_pct(metrics.get("total_return"))),
+        ("CAGR", _fmt_pct(metrics.get("cagr"))),
+        ("Max Drawdown", _fmt_pct(metrics.get("max_dd"))),
+        ("Sharpe", f"{metrics.get('sharpe'):.2f}" if isinstance(metrics.get("sharpe"), (int, float)) else "-"),
+    ]
+    md = ["| Metrik | Değer |", "|---|---|"] + [f"| {k} | {v} |" for k, v in rows]
+    return "\n".join(md)
+
+def _bt_trades_preview(trades: Any, limit: int = 5) -> str:
+    try:
+        if not trades:
+            return "_(işlem kaydı yok)_"
+        rows = ["| Giriş | Çıkış | Yön | Giriş Fiyatı | Çıkış Fiyatı | PnL | Neden |",
+                "|---|---|---|---:|---:|---:|---|"]
+        for t in trades[:limit]:
+            rows.append(
+                f"| {_fmt_date(t.get('entry_date'))} | {_fmt_date(t.get('exit_date'))} | "
+                f"{t.get('side','-')} | {_fmt_usd(t.get('entry'))} | {_fmt_usd(t.get('exit'))} | "
+                f"{_fmt_usd(t.get('pnl'))} | {t.get('reason','-')} |"
+            )
+        return "\n".join(rows)
+    except Exception:
+        return "_(işlemler gösterilemiyor)_"
+
 # -----------------------------------------------------------------------------
 # Ana derleyici
 # -----------------------------------------------------------------------------
@@ -113,9 +157,9 @@ def _assemble_markdown(
     regime: Dict[str, Any],
     risk_plan: Dict[str, Any],
     anomalies: List[Dict[str, Any]],
+    backtest: Optional[Dict[str, Any]] = None,   # <-- eklendi
 ) -> str:
     # --- Quality özet ---
-    qrep = (quality or {}).get("report") or {}
     coverage_years = (quality or {}).get("coverage_years")
     coverage_class = (quality or {}).get("coverage_class")
     nan_ratio_max = (quality or {}).get("nan_ratio_max")
@@ -132,7 +176,6 @@ def _assemble_markdown(
     aic        = (best or {}).get("meta", {}).get("aic")
     yhat: Optional[pd.Series] = (best or {}).get("yhat")
 
-    # Forecast tarih aralığı
     fc_start = _fmt_date(yhat.index[0]) if isinstance(yhat, pd.Series) and len(yhat) else "-"
     fc_end   = _fmt_date(yhat.index[-1]) if isinstance(yhat, pd.Series) and len(yhat) else "-"
 
@@ -154,7 +197,11 @@ def _assemble_markdown(
     atr           = (risk_plan or {}).get("atr")
     atr_window    = (risk_plan or {}).get("atr_window")
 
-    # --- Uyarılar otomatik üret ---
+    # --- Backtest ---
+    bt_metrics = (backtest or {}).get("metrics") if isinstance(backtest, dict) else None
+    bt_trades  = (backtest or {}).get("trades") if isinstance(backtest, dict) else None
+
+    # --- Uyarılar ---
     warnings_md = []
     if rmse is None and aic is None:
         warnings_md.append("- Model performans metrikleri (RMSE/AIC) raporda eksik görünüyor.")
@@ -165,24 +212,19 @@ def _assemble_markdown(
     if coverage_years is not None and float(coverage_years) < 1.0:
         warnings_md.append("- Veri kapsamı 1 yılın altında (düşük güven).")
 
-    # --- Nihai karar (çok basit kural) ---
+    # --- Nihai karar (basit kural) ---
     if mode != "full":
         final_decision = f"Mod `{mode}` olduğundan işlem açma **önerilmez**."
     elif not risk_plan or (units is not None and float(units) <= 0):
         final_decision = "Risk planı uygun değil → **işlem açma**."
     else:
-        # direction bilgisi varsa
-        if str(direction).lower() == "short":
-            final_decision = "Strateji **short** yönünde küçük boyutlu pozisyonu destekliyor."
-        else:
-            final_decision = "Strateji **long** yönünde küçük boyutlu pozisyonu destekliyor."
+        final_decision = "Strateji **short** yönünde küçük boyutlu pozisyonu destekliyor." \
+            if str(direction).lower() == "short" else \
+            "Strateji **long** yönünde küçük boyutlu pozisyonu destekliyor."
 
     # --- Forecast tablosu ---
     if isinstance(yhat, pd.Series) and len(yhat):
-        rows = [
-            f"| {_fmt_date(idx)} | {_fmt_usd(val)} |"
-            for idx, val in yhat.items()
-        ]
+        rows = [f"| {_fmt_date(idx)} | {_fmt_usd(val)} |" for idx, val in yhat.items()]
         table_md = "\n".join(["| Tarih | Tahmini Fiyat (USDT) |", "|---|---|", *rows])
     else:
         table_md = "_Tahmin bulunamadı._"
@@ -224,6 +266,12 @@ def _assemble_markdown(
 | Take-Profit | { _fmt_usd(tp_price) } |
 | ATR ({atr_window if atr_window is not None else '-'}) | { _fmt_usd(atr) } |
 
+## Backtest Özeti
+{_bt_metrics_table(bt_metrics)}
+
+### İlk 5 İşlem (Özet)
+{_bt_trades_preview(bt_trades, limit=5)}
+
 ## Uyarılar
 {('\n'.join(warnings_md) if warnings_md else '- herhangi bir kritik uyarı yok -')}
 
@@ -258,11 +306,15 @@ def build(
     quality: Dict[str, Any],
     anomalies: List[Dict[str, Any]],
     mode: str,
+    backtest: Optional[Dict[str, Any]] = None,     # <-- eklendi (opsiyonel)
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Raporu oluşturur, (opsiyonel) LLM ile parlatır, konsola basar ve diske yazar.
-    Returns:
+
+    Returns
+    -------
+    dict
         {
           "title": str,
           "body": str,      # markdown
@@ -273,7 +325,7 @@ def build(
     cfg = cfg or {}
 
     title = f"Chimera Raporu • {symbol} • run {run_id}"
-    body_md = _assemble_markdown(run_id, symbol, mode, quality, best, regime, risk_plan, anomalies)
+    body_md = _assemble_markdown(run_id, symbol, mode, quality, best, regime, risk_plan, anomalies, backtest)
     body_final = _maybe_gemini_polish(body_md, cfg)
 
     # Konsola banner
@@ -281,7 +333,7 @@ def build(
     print(banner)
     print(f"[Chimera Notifier] {title}")
     print(banner)
-    print(body_final[:2000] + ("\n...\n" if len(body_final) > 2000 else ""))  # uzun raporu kısaltarak yaz
+    print(body_final[:2000] + ("\n...\n" if len(body_final) > 2000 else ""))
 
     # Dosyaya yaz
     reports_dir = _ensure_reports_dir()

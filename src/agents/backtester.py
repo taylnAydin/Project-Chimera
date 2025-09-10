@@ -1,268 +1,480 @@
-# agents/backtester.py
 """
-Chimera • Backtester
-- Stratejiyi geçmiş veride test eder.
-- Sinyal sağlanmazsa forecasts['y_hat'] ile basit yön stratejisi türetir.
-- SL/TP uygular, ücret/slippage dikkate alır, metrikleri hesaplar.
+Backtester Agent
+================
+
+Amaç
+-----
+Günlük OHLC veri üzerinde basit ve sağlam bir backtest motoru sağlamak:
+- Sinyal verilmezse SMA(10/20) crossover sinyali üretir.
+- Router'dan gelen 'risk_plan' bilgilerini (risk yüzdesi, ATR çarpanları) tercihli kullanır.
+- SL/TP (stop-loss/take-profit) seviyelerini ATR tabanında intraday kontrol eder.
+- Maliyetler için slippage (bps) ve işlem ücreti (bps) uygular.
+- Çıktı olarak temel metrikler, trade listesi ve equity eğrisi döndürür.
+
+Kullanım
+--------
+>>> from src.agents import backtester
+>>> out = backtester.run(df, forecasts=None, signals=None, cfg={"risk": risk_plan})
+>>> out["metrics"], out["trades"], out["equity"]
+
+Beklenen Girdi
+--------------
+df : pd.DataFrame
+    - DatetimeIndex (artan sırada)
+    - Zorunlu kolon: 'Close'
+    - Tercihen: 'Open', 'High', 'Low' (intraday SL/TP kontrolü için)
+forecasts : dict | None
+    - Şimdilik kullanılmıyor (ileride sinyal üretimiyle bağlanabilir)
+signals : pd.Series | None
+    - Değerleri -1/0/+1 olan sinyal serisi (index=df.index). None ise SMA(10/20) ile üretilir.
+cfg : dict
+    - Aşağıdaki anahtarları içerebilir:
+      {
+        "risk": {                      # (opsiyonel) router risk_plan'dan taşınır
+          "risk_pct_effective": 0.004, # %0.4
+          "stop_atr_mult": 2.0,
+          "tp_atr_mult": 3.0
+        },
+        "initial_equity": 10_000.0,
+        "atr_window": 14,
+        "slippage_bps": 5,             # 0.05%
+        "fee_bps": 10,                 # 0.10% (giriş/çıkış başına)
+        "long_only": True              # False ise short'a da izin verir
+      }
+
+Çıktı
+-----
+dict:
+{
+  "metrics": {
+     "trades": int,            # işlem adedi
+     "win_rate": float,        # kazanma oranı (0-1)
+     "total_return": float,    # toplam getiri (0-1)
+     "cagr": float,            # yıllıklandırılmış getiri (0-1)
+     "max_dd": float,          # maksimum düşüş (0-1)
+     "sharpe": float           # naive yıllıklandırılmış Sharpe (rf=0 varsayımı)
+  },
+  "trades": [
+     {
+       "entry_date": Timestamp,
+       "exit_date":  Timestamp,
+       "side": "long"|"short",
+       "entry": float,
+       "exit": float,
+       "qty": float,
+       "pnl": float,
+       "r_mult": float|nan,    # risk başına R
+       "reason": "sl"|"tp"|"signal"|"eod"
+     }, ...
+  ],
+  "equity": pd.Series          # zaman içinde özsermaye
+}
+
+Notlar
+------
+- Sinyal değişimi "crossover anında" (+1/-1) tetiklenir, diğer günler 0'dır.
+- ATR, OHLC varsa klasik True Range ile; yoksa Close değişimlerinden türetilmiş
+  bir proxy ile hesaplanır.
+- Short P&L: qty * (entry - px) (qty > 0 kabulüyle, işaret side ile kontrol edilir).
 """
 
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, TypedDict
-from math import sqrt
-
-try:
-    import pandas as pd  # type: ignore
-    import numpy as np   # type: ignore
-except Exception:
-    pd = None  # type: ignore
-    np = None  # type: ignore
+from typing import Dict, Any, List, Optional
+import math
+import numpy as np
+import pandas as pd
 
 
-class BacktestResult(TypedDict, total=False):
-    metrics: Dict[str, float]
-    equity: List[Dict[str, Any]]
-    trades: List[Dict[str, Any]]
+# =============================================================================
+# Yardımcı Fonksiyonlar
+# =============================================================================
+def _ensure_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Girdi DataFrame'ini doğrular ve indeks ile sıralamayı garanti eder.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        En az 'Close' kolonu bulunan, DatetimeIndex'li DataFrame.
+
+    Returns
+    -------
+    pd.DataFrame
+        Tarih indeksine göre artan sıralı kopya.
+
+    Raises
+    ------
+    ValueError
+        'Close' kolonu yoksa.
+    """
+    if "Close" not in df.columns:
+        raise ValueError("backtester: 'Close' kolonu zorunludur.")
+    dff = df.copy()
+    dff.index = pd.to_datetime(dff.index)
+    if not dff.index.is_monotonic_increasing:
+        dff = dff.sort_index()
+    return dff
 
 
-# ----------------------
-# Yardımcı hesaplar
-# ----------------------
+def _atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
+    """
+    Ortalama Gerçek Aralık (ATR) hesabı.
 
-def _to_iso(ts: Any) -> str:
-    if pd is None:
-        return str(ts)
-    t = pd.Timestamp(ts)
-    if t.tzinfo is None:
-        t = t.tz_localize("UTC")
-    return t.isoformat()
+    Eğer 'High'/'Low' mevcut değilse, ATR yerine Close bazlı bir volatilite
+    proxy'si kullanılır (ortalama mutlak getiri * fiyat).
 
-def _max_drawdown(equity: Any) -> float:
-    if pd is None or equity is None or getattr(equity, "empty", True):
+    Parameters
+    ----------
+    df : pd.DataFrame
+        OHLC içeren DataFrame (en az Close).
+    window : int, default 14
+        ATR periyodu.
+
+    Returns
+    -------
+    pd.Series
+        ATR serisi.
+    """
+    if {"High", "Low", "Close"}.issubset(df.columns):
+        h = df["High"].astype(float)
+        l = df["Low"].astype(float)
+        c = df["Close"].astype(float)
+        prev_c = c.shift(1)
+        tr = pd.concat([
+            (h - l).abs(),
+            (h - prev_c).abs(),
+            (l - prev_c).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(window=window, min_periods=max(2, window // 2)).mean()
+        return atr
+    # Fallback proxy
+    c = df["Close"].astype(float)
+    proxy = (c.pct_change().abs().rolling(window, min_periods=window // 2).mean() * c)
+    return proxy.fillna(method="bfill")
+
+
+def _sma(sig: pd.Series, n: int) -> pd.Series:
+    """
+    Basit Hareketli Ortalama (SMA).
+
+    Parameters
+    ----------
+    sig : pd.Series
+        Girdi seri.
+    n : int
+        Pencere.
+
+    Returns
+    -------
+    pd.Series
+        SMA serisi.
+    """
+    return sig.rolling(n, min_periods=n).mean()
+
+
+def _gen_signals(df: pd.DataFrame) -> pd.Series:
+    """
+    SMA(10/20) crossover tabanlı -1/0/+1 sinyal üretir.
+
+    Kurallar
+    --------
+    - f = SMA(10), s = SMA(20)
+    - İşaret = sign(f - s)
+    - İşaret değişiminde sinyal üretilir: +1 (upcross), -1 (downcross)
+    - Diğer günler 0 (flat)
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        OHLC(+) verisi.
+
+    Returns
+    -------
+    pd.Series
+        -1/0/+1 sinyal serisi.
+    """
+    c = df["Close"].astype(float)
+    f = _sma(c, 10)
+    s = _sma(c, 20)
+    raw = np.sign((f - s).fillna(0.0))
+    sig = raw.diff().fillna(0.0)
+    out = sig.copy()
+    out[(sig > 0)] = 1
+    out[(sig < 0)] = -1
+    out[(sig == 0)] = 0
+    return out.astype(int)
+
+
+def _annualized_return(equity: pd.Series) -> float:
+    """
+    Yıllıklandırılmış getiri (CAGR).
+
+    Parameters
+    ----------
+    equity : pd.Series
+        Özsermaye zaman serisi.
+
+    Returns
+    -------
+    float
+        CAGR (0-1).
+    """
+    if len(equity) < 2:
+        return 0.0
+    ret = equity.iloc[-1] / equity.iloc[0] - 1.0
+    days = (equity.index[-1] - equity.index[0]).days or 1
+    years = days / 365.25
+    return (1.0 + ret) ** (1.0 / years) - 1.0 if years > 0 else ret
+
+
+def _max_drawdown(equity: pd.Series) -> float:
+    """
+    Maksimum gerileme (max drawdown).
+
+    Parameters
+    ----------
+    equity : pd.Series
+
+    Returns
+    -------
+    float
+        Max DD (0-1, negatif değerli bir oran olarak yorumlanır).
+    """
+    if equity.empty:
         return 0.0
     peak = equity.cummax()
-    dd = (equity / peak) - 1.0
+    dd = equity / peak - 1.0
     return float(dd.min())
 
-def _sharpe(returns: Any, periods_per_year: int = 252, rf: float = 0.0) -> float:
-    if pd is None or returns is None:
-        return 0.0
-    try:
-        nz = returns.dropna()
-        if nz.empty:
-            return 0.0
-        ex = nz - rf / periods_per_year
-        mu = ex.mean()
-        sd = ex.std(ddof=0)
-        if sd == 0 or (np is not None and np.isnan(sd)):
-            return 0.0
-        return float((mu / sd) * sqrt(periods_per_year))
-    except Exception:
-        return 0.0
 
-def _cagr(equity: Any, periods_per_year: int = 252) -> float:
-    if pd is None or equity is None or getattr(equity, "empty", True):
-        return 0.0
-    try:
-        total_ret = float(equity.iloc[-1] / equity.iloc[0] - 1.0)
-        years = max(1e-9, len(equity) / periods_per_year)
-        return float((1.0 + total_ret) ** (1.0 / years) - 1.0)
-    except Exception:
-        return 0.0
-
-def _apply_fees_slippage(px: float, fee_bps: float, slip_bps: float, side: int) -> float:
-    """İşlem fiyatını ücret/slippage ile ayarla. side: +1 alım, -1 satım."""
-    adj = (fee_bps + slip_bps) / 10000.0
-    return px * (1.0 + adj) if side > 0 else px * (1.0 - adj)
-
-def _derive_signals_from_forecast(df: Any, forecasts: Dict[str, Any] | None, hold_threshold: float) -> Any:
-    """y_hat'in günlük değişimine göre yön: >th → long, <−th → short, aksi 0."""
-    if pd is None or forecasts is None:
-        return None
-    y_hat = forecasts.get("y_hat")
-    if y_hat is None or not isinstance(y_hat, pd.Series):
-        return None
-    y_hat = y_hat.reindex(df.index).astype(float)
-    yret = y_hat.pct_change()
-    sig = pd.Series(0, index=df.index)
-    sig[yret > hold_threshold] = 1
-    sig[yret < -hold_threshold] = -1
-    return sig
-
-def _backtest_core(df: Any,
-                   signals: Any,
-                   start_capital: float,
-                   fee_bps: float,
-                   slippage_bps: float,
-                   position_mode: str,
-                   position_size: float,
-                   risk_cfg: Optional[Dict[str, float]] = None) -> BacktestResult:
+def _sharpe(equity: pd.Series) -> float:
     """
-    Basit trade simülasyonu: sinyale göre pozisyon al/sat, SL/TP uygula.
-    - position_mode="cash": her işlemde sermayenin 'position_size' oranı kullanılır.
-    - position_mode="fixed": her işlemde sabit adet (position_size) alınır/satılır.
+    Naive yıllıklandırılmış Sharpe oranı (rf=0 varsayılarak).
+
+    Parameters
+    ----------
+    equity : pd.Series
+
+    Returns
+    -------
+    float
+        Sharpe oranı.
     """
-    if pd is None or df is None or "close" not in getattr(df, "columns", []):
-        return BacktestResult(metrics={}, equity=[], trades=[])
-
-    close = df["close"].astype(float)
-    if signals is None or not isinstance(signals, pd.Series):
-        return BacktestResult(metrics={}, equity=[], trades=[])
-
-    signals = signals.reindex(close.index).fillna(0).astype(int)
-
-    # Risk parametreleri
-    sl = (risk_cfg or {}).get("stop_loss")
-    tp = (risk_cfg or {}).get("take_profit")
-
-    # Simülasyon durumları
-    equity: List[Dict[str, Any]] = []
-    trades: List[Dict[str, Any]] = []
-    cash = float(start_capital)
-    pos = 0.0           # adet (unit)
-    side = 0            # 1: long, -1: short, 0: flat
-    entry_px: Optional[float] = None
-    entry_idx: Any = None
-
-    for i, (ts, px) in enumerate(close.items()):
-        sig = int(signals.iloc[i])
-
-        def _should_exit(cur_px: float) -> bool:
-            if side == 0 or entry_px is None:
-                return False
-            # SL/TP kontrolü
-            if sl is not None and tp is not None:
-                rr = (cur_px - entry_px) / entry_px * side
-                if rr <= -abs(sl) or rr >= abs(tp):
-                    return True
-            return sig != side  # sinyal yön değiştiyse çık
-
-        # pozisyonu kapat
-        if _should_exit(float(px)):
-            exit_px = _apply_fees_slippage(float(px), fee_bps, slippage_bps, -side)
-            cash += pos * exit_px * side  # short için side=-1 olduğundan doğru işaret
-            pnl = pos * (exit_px - entry_px) * side if entry_px is not None else 0.0
-            trades.append({
-                "entry_ts": _to_iso(entry_idx),
-                "entry_px": float(entry_px),
-                "side": side,
-                "exit_ts": _to_iso(ts),
-                "exit_px": float(exit_px),
-                "pnl": float(pnl),
-            })
-            pos, side, entry_px, entry_idx = 0.0, 0, None, None
-
-        # pozisyon yoksa ve sinyal varsa aç
-        if side == 0 and sig != 0:
-            # alım/satım büyüklüğü
-            if position_mode == "cash":
-                notional = cash * float(position_size)
-                qty = (notional / float(px))
-            else:  # "fixed"
-                qty = float(position_size)
-
-            trade_px = _apply_fees_slippage(float(px), fee_bps, slippage_bps, sig)
-
-            if sig > 0:  # long aç
-                cost = qty * trade_px
-                if cost > cash:
-                    qty = cash / trade_px  # yettiği kadar al
-                    cost = qty * trade_px
-                cash -= cost
-                pos = qty
-                side = 1
-            else:        # short aç
-                pos = qty
-                side = -1
-                cash += qty * trade_px  # kısa satış geliri kasaya eklenir
-
-            entry_px = trade_px
-            entry_idx = ts
-
-        # equity hesapla
-        mtm = cash
-        if side != 0 and entry_px is not None:
-            mtm += side * pos * float(px)
-        equity.append({"ts": _to_iso(ts), "equity": float(mtm)})
-
-    # açık pozisyonu son bar'da kapat
-    if side != 0 and entry_px is not None:
-        last_ts = close.index[-1]
-        exit_px = _apply_fees_slippage(float(close.iloc[-1]), fee_bps, slippage_bps, -side)
-        cash += pos * exit_px * side
-        pnl = pos * (exit_px - entry_px) * side
-        trades.append({
-            "entry_ts": _to_iso(entry_idx),
-            "entry_px": float(entry_px),
-            "side": side,
-            "exit_ts": _to_iso(last_ts),
-            "exit_px": float(exit_px),
-            "pnl": float(pnl),
-        })
-        pos, side, entry_px, entry_idx = 0.0, 0, None, None
-        equity[-1]["equity"] = float(cash)
-
-    # metrikler
-    if pd is not None:
-        equity_ser = pd.Series([e["equity"] for e in equity],
-                               index=[pd.Timestamp(e["ts"]) for e in equity])
-        ret_ser = equity_ser.pct_change()
-        total_return = float(equity_ser.iloc[-1] / equity_ser.iloc[0] - 1.0)
-        cagr = _cagr(equity_ser)
-        sharpe = _sharpe(ret_ser)
-        max_dd = _max_drawdown(equity_ser)
-    else:
-        equity_ser = None
-        total_return = cagr = sharpe = max_dd = 0.0
-
-    wins = sum(1 for t in trades if t["pnl"] > 0)
-    win_rate = float(wins / max(1, len(trades)))
-
-    return BacktestResult(
-        metrics={
-            "total_return": total_return,
-            "cagr": cagr,
-            "sharpe": sharpe,
-            "max_dd": max_dd,
-            "win_rate": win_rate,
-            "trades": float(len(trades)),
-        },
-        equity=equity,
-        trades=trades
-    )
+    rets = equity.pct_change().dropna()
+    if len(rets) < 2:
+        return 0.0
+    mu = rets.mean() * 252
+    sd = rets.std(ddof=0) * (252 ** 0.5)
+    return float(mu / sd) if sd > 0 else 0.0
 
 
-# ----------------------
-# Dış API
-# ----------------------
-
-def run(df: Any,
-        forecasts: Dict[str, Any] | None = None,
-        signals: Any = None,
-        cfg: Optional[Dict[str, Any]] = None) -> BacktestResult:
+# =============================================================================
+# Ana Backtest Çalıştırıcısı
+# =============================================================================
+def run(
+    df: pd.DataFrame,
+    forecasts: Optional[Dict[str, Any]] = None,
+    signals: Optional[pd.Series] = None,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
-    Ana giriş noktası.
-    - `signals` verilmişse onu kullanır.
-    - `signals` None ise `forecasts['y_hat']` ile yön sinyali türetir.
+    Basit kurallı backtest çalıştırır.
+
+    İş Akışı
+    --------
+    1) Girdi verisi doğrulanır ve sıralanır.
+    2) Sinyaller yoksa SMA(10/20) crossover sinyalleri üretilir.
+    3) ATR hesaplanır; risk planı varsa risk yüzdesi ve ATR çarpanları okunur.
+    4) Sinyal gününde pozisyon açılır (long_only=True ise sadece long).
+    5) Pozisyon açıkken her gün SL/TP intraday kontrol edilir; tetiklenirse çıkar.
+    6) Karşıt sinyal geldiğinde gün kapanışında pozisyon kapatılır.
+    7) Slippage ve işlem ücreti bps cinsinden uygulanır.
+    8) Equity, trades ve metrikler döndürülür.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DatetimeIndex'li OHLC(+) DataFrame. 'Close' zorunlu; 'High/Low' varsa SL/TP intraday çalışır.
+    forecasts : dict | None
+        Şimdilik kullanılmıyor. Gelecekte sinyal türetmek için entegre edilebilir.
+    signals : pd.Series | None
+        Dışarıdan sağlanan -1/0/+1 sinyalleri. None ise otomatik üretilir.
+    cfg : dict | None
+        Backtest ayarları ve opsiyonel risk planı. Detaylar dosya üstü docstring'de.
+
+    Returns
+    -------
+    dict
+        metrics, trades, equity anahtarlarını içeren sözlük.
+
+    Raises
+    ------
+    ValueError
+        Girdi DataFrame geçersizse.
     """
     cfg = cfg or {}
-    start_capital = float(cfg.get("start_capital", 10000.0))
-    fee_bps = float(cfg.get("fee_bps", 5.0))
-    slippage_bps = float(cfg.get("slippage_bps", 5.0))
-    position_mode = str(cfg.get("position_mode", "cash"))
-    position_size = float(cfg.get("position_size", 1.0))
-    hold_threshold = float(cfg.get("hold_threshold", 0.0005))
-    risk_cfg = cfg.get("risk")
+    dff = _ensure_ohlc(df)
 
+    # --- Parametreler ---
+    init_eq = float(cfg.get("initial_equity", 10_000.0))
+    atr_win = int(cfg.get("atr_window", 14))
+    slip_bps = float(cfg.get("slippage_bps", 5.0)) / 10_000.0
+    fee_bps = float(cfg.get("fee_bps", 10.0)) / 10_000.0
+    long_only = bool(cfg.get("long_only", True))
+
+    # Risk planı (router'dan gelebilir)
+    risk = cfg.get("risk", {}) or {}
+    risk_pct = float(risk.get("risk_pct_effective", 0.004))  # %0.4
+    stop_mult = float(risk.get("stop_atr_mult", 2.0))
+    tp_mult = float(risk.get("tp_atr_mult", 3.0))
+
+    # --- Sinyaller ---
     if signals is None:
-        signals = _derive_signals_from_forecast(df, forecasts, hold_threshold)
+        signals = _gen_signals(dff)
+    else:
+        signals = signals.reindex(dff.index).fillna(0).astype(int)
 
-    return _backtest_core(
-        df=df,
-        signals=signals,
-        start_capital=start_capital,
-        fee_bps=fee_bps,
-        slippage_bps=slippage_bps,
-        position_mode=position_mode,
-        position_size=position_size,
-        risk_cfg=risk_cfg
+    # --- ATR ---
+    atr = _atr(dff, window=atr_win).reindex(dff.index).bfill()
+
+    # --- OHLC sütunları ---
+    close = dff["Close"].astype(float)
+    high = dff["High"].astype(float) if "High" in dff.columns else close
+    low = dff["Low"].astype(float) if "Low" in dff.columns else close
+
+    # --- Portföy durumu ---
+    equity = pd.Series(index=dff.index, dtype=float)
+    equity.iloc[0] = init_eq
+    cash = init_eq
+    position = 0           # +1 long, -1 short, 0 flat
+    qty = 0.0
+    entry = 0.0
+    stop = math.nan
+    tp = math.nan
+    trades: List[Dict[str, Any]] = []
+    prev_eq = init_eq
+    entry_date = None
+
+    # --- Ana döngü ---
+    for i, dt in enumerate(dff.index):
+        px = float(close.iloc[i])
+        atr_i = float(atr.iloc[i]) if (isinstance(atr.iloc[i], (int, float, np.floating)) and atr.iloc[i] > 0) else 0.02 * px
+
+        # (1) Açık pozisyonu SL/TP ve sinyal ile kapatma
+        if position != 0:
+            hit_sl = (low.iloc[i] <= stop <= high.iloc[i]) if not math.isnan(stop) else False
+            hit_tp = (low.iloc[i] <= tp <= high.iloc[i]) if not math.isnan(tp) else False
+
+            exit_price = None
+            exit_reason = None
+
+            # Öncelik: SL -> TP
+            if hit_sl:
+                exit_price = stop
+                exit_reason = "sl"
+            elif hit_tp:
+                exit_price = tp
+                exit_reason = "tp"
+
+            # Karşıt sinyalde gün kapanışında çık
+            if exit_price is None:
+                sig_now = int(signals.iloc[i])
+                if (position == 1 and sig_now < 0) or (position == -1 and sig_now > 0):
+                    exit_price = px * (1 - slip_bps) if position == 1 else px * (1 + slip_bps)
+                    exit_reason = "signal"
+
+            if exit_price is not None:
+                fee = abs(qty) * exit_price * fee_bps
+                pnl = (exit_price - entry) * qty if position == 1 else (entry - exit_price) * qty
+                pnl -= fee
+                cash += pnl
+                trades.append(dict(
+                    entry_date=entry_date,
+                    exit_date=dt,
+                    side="long" if position == 1 else "short",
+                    entry=float(entry),
+                    exit=float(exit_price),
+                    qty=float(qty),
+                    pnl=float(pnl),
+                    r_mult=(pnl / (risk_pct * prev_eq)) if prev_eq > 0 else float("nan"),
+                    reason=exit_reason
+                ))
+                position, qty, entry, stop, tp = 0, 0.0, 0.0, math.nan, math.nan
+                entry_date = None
+
+        # (2) Giriş
+        if position == 0:
+            sig_now = int(signals.iloc[i])
+            if sig_now == 1 or (sig_now == -1 and not long_only):
+                eq_now = cash
+                risk_dollars = eq_now * risk_pct
+                stop_dist = stop_mult * atr_i if stop_mult * atr_i > 0 else 0.02 * px
+                qty = risk_dollars / max(stop_dist, 1e-9)
+
+                # Çok küçük işlemleri atla
+                if qty * px >= 10:
+                    side = 1 if sig_now == 1 else -1
+                    entry_px = px * (1 + slip_bps) if side == 1 else px * (1 - slip_bps)
+                    fee = qty * entry_px * fee_bps
+                    cash -= fee
+
+                    position = side
+                    entry = entry_px
+                    entry_date = dt
+                    if side == 1:
+                        stop = entry - stop_mult * atr_i
+                        tp = entry + tp_mult * atr_i
+                    else:
+                        stop = entry + stop_mult * atr_i
+                        tp = entry - tp_mult * atr_i
+
+        # (3) Gün sonu MTM
+        mtm = cash
+        if position != 0:
+            if position == 1:
+                mtm += qty * px
+            else:  # short
+                mtm += qty * (entry - px)
+        equity.iloc[i] = mtm
+        prev_eq = mtm
+
+    # (4) Son gün pozisyonu kapat (varsa)
+    if position != 0:
+        px = float(close.iloc[-1])
+        exit_price = px * (1 - slip_bps) if position == 1 else px * (1 + slip_bps)
+        fee = abs(qty) * exit_price * fee_bps
+        pnl = (exit_price - entry) * qty if position == 1 else (entry - exit_price) * qty
+        pnl -= fee
+        cash += pnl
+        trades.append(dict(
+            entry_date=entry_date,
+            exit_date=dff.index[-1],
+            side="long" if position == 1 else "short",
+            entry=float(entry),
+            exit=float(exit_price),
+            qty=float(qty),
+            pnl=float(pnl),
+            r_mult=(pnl / (risk_pct * equity.iloc[-2])) if len(equity) > 1 and equity.iloc[-2] > 0 else float("nan"),
+            reason="eod"
+        ))
+        equity.iloc[-1] = cash
+
+    # --- Metrikler ---
+    pnl_list = [t["pnl"] for t in trades]
+    wins = sum(1 for x in pnl_list if x > 0)
+    total_return = float(equity.iloc[-1] / equity.iloc[0] - 1.0) if len(equity) else 0.0
+
+    metrics = dict(
+        trades=len(trades),
+        win_rate=(wins / len(trades) if trades else 0.0),
+        total_return=total_return,
+        cagr=_annualized_return(equity),
+        max_dd=_max_drawdown(equity),
+        sharpe=_sharpe(equity),
     )
+
+    return {
+        "metrics": metrics,
+        "trades": trades,
+        "equity": equity,
+    }
