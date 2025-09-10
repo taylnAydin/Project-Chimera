@@ -61,7 +61,8 @@ class ChimeraState(TypedDict, total=False):
     regime: Dict[str, Any]
     risk_plan: Dict[str, Any]
     anomalies: List[Dict[str, Any]]
-    backtest: Dict[str, Any]           # <-- yeni: backtest sonuçları
+    backtest: Dict[str, Any]
+    eval_last: Dict[str, Any]            # <-- SON 10 GÜN eval çıktısı
 
     # Akış kontrol
     mode: Literal["full", "analyze", "block"]
@@ -88,7 +89,8 @@ def make_initial_state(symbol: str, start: str, end: str, cfg: Dict[str, Any]) -
         regime={},
         risk_plan={},
         anomalies=[],
-        backtest={},            # <-- yeni
+        backtest={},
+        eval_last={},              # <-- eklendi
         mode="full",
         halt_reason=None,
         errors=[],
@@ -197,6 +199,37 @@ def node_model_selection(state: ChimeraState) -> ChimeraState:
     )
     return state
 
+@with_try("eval_last")
+def node_eval_last(state: ChimeraState) -> ChimeraState:
+    """
+    Seçilen modelin 'son 10 gün' dışörnek performansını üretir.
+    forecast.evaluate_last_k_days(...) çağrısını yapar ve state['eval_last'] içine yazar.
+    """
+    if state["mode"] == "block":
+        return state
+
+    best = state.get("best", {}) or {}
+    meta = best.get("meta", {}) or {}
+
+    model_name = (meta.get("model") or best.get("name") or "ETS").lower()
+    horizon = int(meta.get("horizon") or state["cfg"].get("forecast", {}).get("horizon", 7))
+
+    exog_cols = None
+    fc_cfg = state["cfg"].get("forecast", {}) or {}
+    if isinstance(fc_cfg.get("exog"), dict):
+        exog_cols = fc_cfg["exog"].get("cols")
+
+    k = 10  # sabit: son 10 gün
+
+    state["eval_last"] = forecast.evaluate_last_k_days(
+        state["df"],
+        model_name=model_name,
+        horizon=horizon,
+        exog_cols=exog_cols,
+        k=k,
+    )
+    return state
+
 @with_try("regime_detector")
 def node_regime(state: ChimeraState) -> ChimeraState:
     if state["mode"] == "block":
@@ -216,7 +249,7 @@ def node_risk(state: ChimeraState) -> ChimeraState:
     state["risk_plan"] = risk.plan(state["best"], state["regime"], state["cfg"].get("risk", {}))
     return state
 
-@with_try("backtester")  # <-- yeni node
+@with_try("backtester")
 def node_backtest(state: ChimeraState) -> ChimeraState:
     """
     Amaç: Stratejiyi geçmiş veride test etmek.
@@ -226,20 +259,17 @@ def node_backtest(state: ChimeraState) -> ChimeraState:
     if state["mode"] == "block":
         return state
 
-    # backtest cfg: kullanıcı config'ten al; yoksa makul varsayılanlar
     bt_cfg = state["cfg"].get("backtest", {})
-    # risk_plan varsa cfg içine geçir (backtester opsiyonel kullanır)
     if state.get("risk_plan"):
         bt_cfg = {**bt_cfg, "risk": state["risk_plan"]}
 
     state["backtest"] = backtester.run(
         df=state["df"],
         forecasts=state.get("forecasts"),
-        signals=None,                 # sinyal yoksa forecasts'tan türetir
+        signals=None,
         cfg=bt_cfg
     )
 
-    # (Opsiyonel) backtest sonuçlarını persistence'a yaz
     try:
         if hasattr(persistence, "save_backtest"):
             persistence.save_backtest(
@@ -266,8 +296,6 @@ def node_persist(state: ChimeraState) -> ChimeraState:
         anomalies=state["anomalies"],
         mode=state["mode"],
         halt_reason=state["halt_reason"],
-        # backtest'i burada **opsiyonel** tut: persistence.save_run_artifacts imzası desteklemiyorsa hata olur.
-        # Bu yüzden yukarıda ayrı save_backtest ile denedik.
     )
     return state
 
@@ -282,7 +310,8 @@ def node_reporter(state: ChimeraState) -> ChimeraState:
         quality=state["quality"],
         anomalies=state["anomalies"],
         mode=state["mode"],
-        backtest=state.get("backtest", {}),  
+        backtest=state.get("backtest", {}),
+        eval_last=state.get("eval_last", {}),   # <-- eval_last rapora iletiliyor
         cfg=state["cfg"].get("report", {})
     )
     return state
@@ -312,16 +341,9 @@ def node_end_fail(state: ChimeraState) -> ChimeraState:
 # ======================================================================================
 
 def branch_after_guardrails(state: ChimeraState) -> str:
-    # guardrails sonrası: block → persist, ok → anomaly/forecast
     return "blocked" if state["mode"] == "block" else "ok"
 
 def branch_after_regime(state: ChimeraState) -> str:
-    """
-    regime sonrası:
-      - full      → risk
-      - analyze   → backtest (risk atla)
-      - block(*)  → persist (fail-safe)
-    """
     if state["mode"] == "full":
         return "go_risk"
     elif state["mode"] == "analyze":
@@ -330,7 +352,6 @@ def branch_after_regime(state: ChimeraState) -> str:
         return "skip_to_persist"
 
 def branch_after_risk(state: ChimeraState) -> str:
-    # risk sonrası full modda backtest'e geç
     return "go_backtest"
 
 def branch_end(state: ChimeraState) -> str:
@@ -354,9 +375,10 @@ def build_graph() -> Any:
         g.add_node("anomaly", node_anomaly)
     g.add_node("forecast", node_forecast)
     g.add_node("model_selection", node_model_selection)
+    g.add_node("eval_last", node_eval_last)          # <-- eklendi
     g.add_node("regime", node_regime)
     g.add_node("risk", node_risk)
-    g.add_node("backtest", node_backtest)      # <-- yeni
+    g.add_node("backtest", node_backtest)
     g.add_node("persist", node_persist)
     g.add_node("reporter", node_reporter)
     g.add_node("notifier", node_notifier)
@@ -384,7 +406,9 @@ def build_graph() -> Any:
     if _ANOMALY_AVAILABLE:
         g.add_edge("anomaly", "forecast")
     g.add_edge("forecast", "model_selection")
-    g.add_edge("model_selection", "regime")
+    g.add_edge("model_selection", "eval_last")   # <-- eval_last araya
+    g.add_edge("eval_last", "regime")
+    g.add_edge("regime", "risk")
 
     # --- Rejim dalı
     g.add_conditional_edges(

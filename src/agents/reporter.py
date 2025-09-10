@@ -16,7 +16,8 @@ Kullanım (router içinde):
         quality=state["quality"],
         anomalies=state["anomalies"],
         mode=state["mode"],
-        backtest=state.get("backtest"),     # <-- opsiyonel: eklendi
+        backtest=state.get("backtest"),
+        eval_last=state.get("eval_last"),   # <-- eklendi
         cfg=state["cfg"].get("report", {})
     )
 """
@@ -31,7 +32,6 @@ import pandas as pd
 
 try:
     from dotenv import load_dotenv
-    # Proje kökünde .env var sayıyoruz: .../src/agents/reporter.py -> ../../.env
     load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
 except Exception:
     pass
@@ -45,7 +45,6 @@ def _maybe_gemini_polish(markdown_text: str, cfg: Dict[str, Any]) -> str:
     REPORTER_USE_LLM=true ve GEMINI_API_KEY varsa metni parlatmayı dener.
     Hata olursa orijinal metni geri döner.
     """
-    # 1) bayrakları topla
     use_llm_env = str(os.getenv("REPORTER_USE_LLM", "false")).lower() == "true"
     use_llm_cfg = bool(cfg.get("use_llm"))
     use_llm = use_llm_env or use_llm_cfg
@@ -53,7 +52,6 @@ def _maybe_gemini_polish(markdown_text: str, cfg: Dict[str, Any]) -> str:
     api_key = os.getenv("GEMINI_API_KEY") or cfg.get("gemini_api_key")
     model_name = cfg.get("gemini_model", "gemini-1.5-flash")
 
-    # 2) debug log (değişkenler tanımlandıktan SONRA)
     print(f"[reporter] Gemini polish enabled? {use_llm and bool(api_key)} "
           f"(use_llm={use_llm}, has_key={bool(api_key)})")
 
@@ -144,6 +142,35 @@ def _bt_trades_preview(trades: Any, limit: int = 5) -> str:
     except Exception:
         return "_(işlemler gösterilemiyor)_"
 
+def _eval_last_table(eval_last: Optional[Dict[str, Any]]) -> str:
+    """
+    Son 10 gün gerçek vs tahmin tablosu. eval_last beklenen şema:
+      {
+        "rows": [{"date": "YYYY-MM-DD", "actual": float, "pred": float, "abs_pct_err": float}, ...],
+        "mape": float,         # 0-1
+        "accuracy": float      # 0-1 (ör: 1 - median(|err|/actual))
+      }
+    """
+    if not isinstance(eval_last, dict) or not eval_last.get("rows"):
+        return "- Veri yok -"
+    lines = [
+        "| Tarih | Gerçek (Close) | Tahmin | Mutlak % Hata |",
+        "|---|---:|---:|---:|",
+    ]
+    for r in eval_last["rows"]:
+        dt = r.get("date", "-")
+        a = r.get("actual", float("nan"))
+        p = r.get("pred", float("nan"))
+        ape = r.get("abs_pct_err", float("nan"))
+        try:
+            lines.append(f"| {dt} | {a:,.2f} | {p:,.2f} | {ape*100:.2f}% |")
+        except Exception:
+            lines.append(f"| {dt} | {a} | {p} | {ape} |")
+    mape = eval_last.get("mape")
+    acc = eval_last.get("accuracy")
+    tail = f"\n**MAPE:** {mape*100:.2f}% • **Doğruluk:** {acc*100:.2f}%" if mape is not None and acc is not None else ""
+    return "\n".join(lines) + tail
+
 # -----------------------------------------------------------------------------
 # Ana derleyici
 # -----------------------------------------------------------------------------
@@ -157,7 +184,8 @@ def _assemble_markdown(
     regime: Dict[str, Any],
     risk_plan: Dict[str, Any],
     anomalies: List[Dict[str, Any]],
-    backtest: Optional[Dict[str, Any]] = None,   # <-- eklendi
+    backtest: Optional[Dict[str, Any]] = None,
+    eval_last: Optional[Dict[str, Any]] = None,
 ) -> str:
     # --- Quality özet ---
     coverage_years = (quality or {}).get("coverage_years")
@@ -250,6 +278,9 @@ def _assemble_markdown(
 
 > Tahmin aralığı: **{fc_start} → {fc_end}**
 
+## Son 10 Gün: Gerçek vs Tahmin
+{_eval_last_table(eval_last)}
+
 ## Piyasa Durumu
 * **Trend:** {trend or '-'} (eğim: {(_fmt_int(trend_slope) if trend_slope is not None else '-')})
 * **Volatilite:** {vol_class or '-'} (yıllık ≈ {(_fmt_pct(vol_ann) if vol_ann is not None else '-')}, z={vol_z if vol_z is not None else '-'})
@@ -306,15 +337,13 @@ def build(
     quality: Dict[str, Any],
     anomalies: List[Dict[str, Any]],
     mode: str,
-    backtest: Optional[Dict[str, Any]] = None,     # <-- eklendi (opsiyonel)
+    backtest: Optional[Dict[str, Any]] = None,
+    eval_last: Optional[Dict[str, Any]] = None,    # <-- eklendi
     cfg: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Raporu oluşturur, (opsiyonel) LLM ile parlatır, konsola basar ve diske yazar.
-
-    Returns
-    -------
-    dict
+    Returns:
         {
           "title": str,
           "body": str,      # markdown
@@ -325,7 +354,10 @@ def build(
     cfg = cfg or {}
 
     title = f"Chimera Raporu • {symbol} • run {run_id}"
-    body_md = _assemble_markdown(run_id, symbol, mode, quality, best, regime, risk_plan, anomalies, backtest)
+    body_md = _assemble_markdown(
+        run_id, symbol, mode, quality, best, regime, risk_plan, anomalies,
+        backtest, eval_last
+    )
     body_final = _maybe_gemini_polish(body_md, cfg)
 
     # Konsola banner

@@ -16,11 +16,29 @@ def ensure_series_close(df: pd.DataFrame) -> pd.Series:
         raise ValueError("'Close' kolonu yok.")
 
     y = pd.to_numeric(df["Close"], errors="coerce").dropna()
+
+    # index kontrol
     if not isinstance(df.index, pd.DatetimeIndex):
         raise ValueError("index DatetimeIndex olmalı.")
     y.index = pd.to_datetime(y.index)
+
+    # sıralama
     if not y.index.is_monotonic_increasing:
         y = y.sort_index()
+
+    # 🔹 frekans ata (statsmodels ValueWarning'ini engeller)
+    try:
+        inferred = pd.infer_freq(y.index)
+        if inferred:
+            # örn: 'D', 'B', 'W-SUN' vs.
+            y.index.freq = pd.tseries.frequencies.to_offset(inferred)
+        else:
+            # fallback: günlük kabul et, reindex yapmadan sadece freq bilgisi ver
+            y.index.freq = pd.tseries.frequencies.to_offset("D")
+    except Exception:
+        # frekans tahmini başarısız olursa sessizce geç
+        pass
+
     if len(y) < 50:
         warnings.warn("Örneklem küçük (<50). Sonuçlar güvenilmez olabilir.", RuntimeWarning)
     return y
@@ -47,7 +65,8 @@ def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 def future_index(last_date: pd.Timestamp, horizon: int, freq: str = "D") -> pd.DatetimeIndex:
     start = pd.to_datetime(last_date) + pd.Timedelta(days=1)
-    return pd.date_range(start=start, periods=horizon, freq=freq)
+    # freq paramı verildiyse onu kullan; verilmediyse 'D'
+    return pd.date_range(start=start, periods=horizon, freq=freq or "D")
 
 def fit_sarimax(y_train: pd.Series, order: Tuple[int,int,int], exog_train: Optional[pd.DataFrame]=None):
     with warnings.catch_warnings():
